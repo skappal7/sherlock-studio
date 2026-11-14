@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -170,7 +170,8 @@ class WMNEngine:
 
 # ------------------------------------------------------------------ Maigret (optional, experimental)
 def maigret_available() -> bool:
-    return shutil.which("maigret") is not None
+    import importlib.util
+    return importlib.util.find_spec("maigret") is not None
 
 
 def run_maigret(username, timeout=15, progress: ProgressFn | None = None):
@@ -178,7 +179,7 @@ def run_maigret(username, timeout=15, progress: ProgressFn | None = None):
     if not maigret_available():
         return []
     with tempfile.TemporaryDirectory() as d:
-        cmd = ["maigret", username, "--json", "simple", "--folderoutput", d, "--timeout",
+        cmd = [sys.executable, "-m", "maigret", username, "--json", "simple", "--folderoutput", d, "--timeout",
                str(timeout), "--no-progressbar", "--no-color", "--no-recursion"]
         try:
             subprocess.run(cmd, capture_output=True, timeout=600, check=False)

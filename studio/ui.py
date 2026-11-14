@@ -122,3 +122,13 @@ def plotly_layout(fig, height=300):
                       paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
                       font=dict(color="#E8ECF6"), legend=dict(font=dict(size=11)))
     return fig
+
+
+def link_tiles(items):
+    """items: (name, tag, url, kind) - clickable tiles for manual checks."""
+    esc = html.escape
+    return '<div class="grid">' + "".join(
+        f'<a class="tile {k}" href="{esc(u)}" target="_blank" rel="noopener noreferrer" '
+        f'style="text-decoration:none;color:inherit"><b>{esc(n)}</b>'
+        f'<span style="color:{MUTED}">{esc(t)} &middot; open profile</span></a>'
+        for n, t, u, k in items) + "</div>"

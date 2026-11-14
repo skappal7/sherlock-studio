@@ -51,6 +51,40 @@ def get_engines(nsfw: bool):
     return out, warn
 
 
+MANUAL = [  # platforms that often block automated checks: (name, key, profile URL)
+    ("Instagram", "instagram", "https://www.instagram.com/{u}/"),
+    ("Facebook", "facebook", "https://www.facebook.com/{u}"),
+    ("X / Twitter", "twitter", "https://x.com/{u}"),
+    ("TikTok", "tiktok", "https://www.tiktok.com/@{u}"),
+    ("LinkedIn", "linkedin", "https://www.linkedin.com/in/{u}"),
+    ("Threads", "threads", "https://www.threads.net/@{u}"),
+    ("Snapchat", "snapchat", "https://www.snapchat.com/add/{u}"),
+    ("YouTube", "youtube", "https://www.youtube.com/@{u}"),
+    ("Pinterest", "pinterest", "https://www.pinterest.com/{u}/"),
+    ("Reddit", "reddit", "https://www.reddit.com/user/{u}"),
+    ("Telegram", "telegram", "https://t.me/{u}"),
+]
+
+
+def manual_panel(user, recs):
+    """Major platforms not confirmed by the engines, with one-click profile links."""
+    by = {E.norm_key(r["site"]): r for r in recs}
+    items = []
+    for name, key, tpl in MANUAL:
+        hit = by.get(key)
+        if hit and hit["status"] == "Found" and hit.get("confidence") != "Low":
+            continue
+        tag = ("Not confirmed" if hit and hit["status"] == "Found" else
+               "Blocked or unreadable" if hit and hit["status"] == "Unknown" else
+               "Not detected" if hit else "Not checked")
+        items.append((name, tag, tpl.format(u=user), "unk"))
+    if items:
+        st.markdown('<div class="sec">Major platforms to check manually</div>', unsafe_allow_html=True)
+        st.markdown(ui.link_tiles(items), unsafe_allow_html=True)
+        st.caption("Instagram, Facebook, X, TikTok and LinkedIn usually block automated requests from cloud servers "
+                   "and show login walls, so they often cannot be detected reliably. Open each link to confirm.")
+
+
 def exposure_index(recs):
     f = [r for r in recs if r["status"] == "Found"]
     hi = sum(r["confidence"] == "High" for r in f)
@@ -127,6 +161,7 @@ def render_username_results(user, recs, ran):
                 ("Exposure index", f"{idx}/100", lab, col)])
     if not found:
         st.info("No accounts detected for this username on the selected sites.")
+        manual_panel(user, recs)
         return
     c1, c2 = st.columns(2)
     cat = pd.Series([r["category"] for r in found]).value_counts().reset_index()
@@ -160,6 +195,7 @@ def render_username_results(user, recs, ran):
         st.dataframe(R.to_df(shown), hide_index=True, width="stretch",
                      column_config={"url": st.column_config.LinkColumn("url")})
 
+    manual_panel(user, recs)
     meta = {"engines": ran}
     st.markdown('<div class="sec">Export</div>', unsafe_allow_html=True)
     d = st.columns(4)
@@ -187,7 +223,7 @@ with t_user:
             avail = list(engines)
             sel_eng = st.multiselect("Engines", avail + (["Maigret"] if E.maigret_available() else []),
                                      default=avail,
-                                     help="Maigret appears only if the optional package is installed.")
+                                     help="Maigret adds ~500 more sites but is slower (a few minutes).")
         with st.expander("Name to username variants"):
             nm = st.text_input("Full name", placeholder="Jane Doe", key="v_name")
             if nm:

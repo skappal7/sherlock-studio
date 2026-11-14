@@ -1,3 +1,2 @@
 # Optional engines. App detects them at runtime and disables the feature if missing.
-maigret
 holehe
