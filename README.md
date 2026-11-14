@@ -15,6 +15,8 @@ Digital footprint audit app built with Streamlit on top of
 - **History**: local SQLite, run-to-run diff, audit log.
 - **Guardrails**: consent gate, purpose log, per-session rate limit. No people-search, phone-to-address or geolocation.
 
+Requires Python 3.11 or newer (3.12 recommended).
+
 ## Run locally
     pip install -r requirements.txt
     streamlit run app.py

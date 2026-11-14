@@ -58,7 +58,17 @@ def test_flows(monkeypatch):
     assert "dm_res" in at.session_state
     # links
     at.text_input(key="lt").set_value("alice"); at.run(); assert not at.exception
-    # rate limit
+    # stale-results banner when a setting changes after a search
+    at.button(key="go_user").click().run()
+    assert not any("Settings changed" in w.value for w in at.warning)
+    at.sidebar.slider[0].set_value(20).run()
+    assert any("Settings changed" in w.value for w in at.warning)
+    # revoking consent hides stored results
+    at.checkbox(key="consent").set_value(False).run()
+    assert any("view results" in i.value for i in at.info)
+    assert not any("High confidence" in m.value for m in at.markdown)
+    at.checkbox(key="consent").set_value(True).run()
+    # rate limit (cost-aware)
     at.session_state["rl"] = [__import__("time").time()] * 20
     at.button(key="go_user").click().run()
     assert any("limit" in e.value for e in at.error)

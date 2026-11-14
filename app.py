@@ -14,6 +14,8 @@ from studio import netinfo as N
 from studio import reports as R
 from studio import store
 from studio import ui
+from studio.models import (CONF_ORDER, BrandResult, Conf, DomainResult, EmailResult, Found,
+                           UserResult)
 
 st.set_page_config(page_title="Sherlock Studio", layout="wide", initial_sidebar_state="expanded")
 ui.inject_css()
@@ -72,9 +74,9 @@ def manual_panel(user, recs):
     items = []
     for name, key, tpl in MANUAL:
         hit = by.get(key)
-        if hit and hit["status"] == "Found" and hit.get("confidence") != "Low":
+        if hit and hit["status"] == Found.FOUND and hit.get("confidence") in (Conf.HIGH, Conf.MEDIUM):
             continue
-        tag = ("Not confirmed" if hit and hit["status"] == "Found" else
+        tag = ("Not confirmed" if hit and hit["status"] == Found.FOUND else
                "Blocked or unreadable" if hit and hit["status"] == "Unknown" else
                "Not detected" if hit else "Not checked")
         items.append((name, tag, tpl.format(u=user), "unk"))
@@ -90,8 +92,9 @@ def exposure_index(recs):
     hi = sum(r["confidence"] == "High" for r in f)
     md = sum(r["confidence"] == "Medium" for r in f)
     lo = sum(r["confidence"] == "Low" for r in f)
+    un = sum(r["confidence"] == "Unverified" for r in f)
     cats = len({r["category"] for r in f})
-    return min(100, round(hi * 4 + md * 2 + lo * 0.5 + cats * 2))
+    return min(100, round(hi * 4 + md * 2 + un * 1 + lo * 0.5 + cats * 2))
 
 
 def exposure_label(v):
@@ -121,13 +124,15 @@ for w in warns:
     st.sidebar.warning(w)
 
 
-def gate() -> bool:
+def gate(cost: int = 1) -> bool:
+    """Consent + rate-limit check. Charges `cost` searches (one per username in a batch)."""
     if not consent:
         st.warning("Tick the responsible-use box in the sidebar to run searches.")
         return False
-    ok, st.session_state["rl"] = store.rate_ok(st.session_state.get("rl", []), RATE_LIMIT)
+    ok, st.session_state["rl"] = store.rate_ok(st.session_state.get("rl", []), RATE_LIMIT, cost=cost)
     if not ok:
-        st.error("Hourly search limit reached for this session. Try again later.")
+        left = max(0, RATE_LIMIT - len(st.session_state["rl"]))
+        st.error(f"Hourly search limit would be exceeded ({cost} requested, {left} left). Try again later.")
     return ok
 
 
@@ -147,6 +152,12 @@ def progress_cb():
 ui.hero()
 t_user, t_brand, t_email, t_domain, t_links, t_hist, t_about = st.tabs(
     ["Username", "Brand check", "Email", "Domain", "Search links", "History", "About"])
+
+
+def current_sig() -> tuple:
+    """Settings that shape results; compared against the signature stored with displayed results."""
+    return (nsfw, timeout, retry, verify, bool(proxy),
+            tuple(sorted(st.session_state.get("u_eng_sig", []))), tuple(sorted(st.session_state.get("u_cat_sig", []))))
 
 
 # ================================================================== USERNAME
@@ -171,24 +182,29 @@ def render_username_results(user, recs, ran):
     fig.update_traces(textinfo="value", marker=dict(line=dict(color="#0B1020", width=2)))
     c1.plotly_chart(ui.plotly_layout(fig), width="stretch")
     conf = pd.Series([r["confidence"] for r in found]).value_counts().reindex(
-        ["High", "Medium", "Low"]).fillna(0).reset_index()
+        CONF_ORDER).fillna(0).reset_index()
     conf.columns = ["confidence", "count"]
     fig2 = px.bar(conf, x="count", y="confidence", orientation="h", color="confidence",
                   color_discrete_map=ui.CONF_COLOR, title="Confidence breakdown")
     fig2.update_layout(showlegend=False, xaxis_title=None,
-                       yaxis=dict(title=None, categoryorder="array", categoryarray=["High", "Medium", "Low"],
+                       yaxis=dict(title=None, categoryorder="array", categoryarray=CONF_ORDER,
                                   autorange="reversed"))
     c2.plotly_chart(ui.plotly_layout(fig2), width="stretch")
-    st.caption("Exposure index is a heuristic: 4 points per high-confidence account, 2 per medium, 0.5 per low, "
-               "plus 2 per category, capped at 100. Use it to compare runs, not as a risk rating.")
+    st.caption("Exposure index is a heuristic: 4 points per high-confidence account, 2 per medium, 1 per unverified, "
+               "0.5 per low, plus 2 per category, capped at 100. Use it to compare runs, not as a risk rating.")
 
+    n_un = sum(r["confidence"] == Conf.UNVERIFIED for r in found)
+    if n_un:
+        skipped = sum(r.get("verify") == "skipped" for r in found)
+        st.caption(f"{n_un} account(s) are unverified: verification was off, blocked, or beyond the cap"
+                   f"{f' ({skipped} skipped)' if skipped else ''}. Treat them as leads, not confirmations.")
     f1, f2, f3 = st.columns([2, 2, 1])
     cats = f1.multiselect("Category", sorted({r["category"] for r in found}), key=f"fc_{user}")
-    confs = f2.multiselect("Confidence", ["High", "Medium", "Low"], default=["High", "Medium", "Low"],
+    confs = f2.multiselect("Confidence", CONF_ORDER, default=CONF_ORDER,
                            key=f"fcf_{user}")
     view = f3.radio("View", ["Cards", "Table"], horizontal=True, key=f"fv_{user}")
     shown = [r for r in found if (not cats or r["category"] in cats) and r["confidence"] in confs]
-    shown.sort(key=lambda r: ({"High": 0, "Medium": 1, "Low": 2}[r["confidence"]], r["site"].lower()))
+    shown.sort(key=lambda r: (CONF_ORDER.index(r["confidence"]), r["site"].lower()))
     if view == "Cards":
         st.markdown(ui.cards(shown), unsafe_allow_html=True)
     else:
@@ -224,6 +240,7 @@ with t_user:
             sel_eng = st.multiselect("Engines", avail + (["Maigret"] if E.maigret_available() else []),
                                      default=avail,
                                      help="Maigret adds ~500 more sites but is slower (a few minutes).")
+        st.session_state["u_eng_sig"], st.session_state["u_cat_sig"] = list(sel_eng), list(chosen_cats)
         with st.expander("Name to username variants"):
             nm = st.text_input("Full name", placeholder="Jane Doe", key="v_name")
             if nm:
@@ -244,29 +261,42 @@ with t_user:
                 st.warning("Enter a username.")
             elif bad:
                 st.warning(f"Invalid username(s): {', '.join(bad)}")
-            elif gate():
+            elif gate(len(names)):
                 eng_sel = {k: v for k, v in engines.items() if k in sel_eng}
+                scope = {"engines": sorted(sel_eng), "categories": sorted(chosen_cats), "nsfw": nsfw,
+                         "verify": verify, "retry": retry}
                 results = {}
                 for n in names:
                     f, done = progress_cb()
-                    prev = store.list_runs("username", n, 1)
-                    prev_data = store.get_run(prev[0]["id"]) if prev else []
+                    prior_any = store.last_run("username", n)
+                    prior = store.last_run("username", n, scope)
+                    prev_data = store.get_run(prior["id"]) if prior else []
                     recs, ran = E.run_username(n, eng_sel, set(chosen_cats), timeout, retry, verify,
                                                proxy, "Maigret" in sel_eng, progress=f)
                     done()
-                    fnd = [r for r in recs if r["status"] == "Found"]
-                    store.save_run("username", n, {"found": len(fnd), "checked": len(recs)}, recs)
+                    fnd = [r for r in recs if r["status"] == Found.FOUND]
+                    store.save_run("username", n, {"found": len(fnd), "checked": len(recs)}, recs, scope)
                     store.audit("username", n, purpose)
-                    results[n] = (recs, ran, store.diff_runs(prev_data, recs) if prev else None)
-                st.session_state["u_res"] = results
+                    results[n] = UserResult(recs, ran, store.diff_runs(prev_data, recs) if prior else None,
+                                            prior_any is not None)
+                st.session_state["u_res"] = {"sig": current_sig(), "users": results}
 
-    for n, (recs, ran, diff) in st.session_state.get("u_res", {}).items():
-        st.markdown(f'<div class="sec">Results for <span style="color:{ui.AMBER}">{n}</span> '
-                    f'<span class="chip">{", ".join(ran)}</span></div>', unsafe_allow_html=True)
-        if diff and (diff[0] or diff[1]):
-            st.info(f"Since the last run: {len(diff[0])} new ({', '.join(diff[0][:8])}"
-                    f"{'...' if len(diff[0]) > 8 else ''}), {len(diff[1])} gone.")
-        render_username_results(n, recs, ran)
+    ures = st.session_state.get("u_res")
+    if ures and not consent:
+        st.info("Tick the responsible-use box in the sidebar to view results.")
+    elif ures:
+        if ures["sig"] != current_sig():
+            st.warning("Settings changed since these results were generated. Search again to apply them.")
+        for n, res in ures["users"].items():
+            st.markdown(f'<div class="sec">Results for <span style="color:{ui.AMBER}">{n}</span> '
+                        f'<span class="chip">{", ".join(res.ran)}</span></div>', unsafe_allow_html=True)
+            if res.diff and (res.diff[0] or res.diff[1]):
+                st.info(f"Since the last run with the same settings: {len(res.diff[0])} new "
+                        f"({', '.join(res.diff[0][:8])}{'...' if len(res.diff[0]) > 8 else ''}), "
+                        f"{len(res.diff[1])} gone.")
+            elif res.diff is None and res.had_prior:
+                st.caption("Earlier runs for this username used different settings, so no comparison is shown.")
+            render_username_results(n, res.recs, res.ran)
 
 # ================================================================== BRAND CHECK
 with t_brand:
@@ -283,18 +313,23 @@ with t_brand:
             done()
             store.save_run("brand", handle, {"checked": len(recs)}, recs)
             store.audit("brand", handle, purpose)
-            st.session_state["b_res"] = (handle, recs)
-    if "b_res" in st.session_state:
-        h, recs = st.session_state["b_res"]
-        taken = [r for r in recs if r["status"] == "Found"]
-        free = [r for r in recs if r["status"] == "Not found"]
-        unk = [r for r in recs if r["status"] == "Unknown"]
+            st.session_state["b_res"] = BrandResult(handle, recs, (nsfw, timeout, retry, bool(proxy)))
+    if "b_res" in st.session_state and not consent:
+        st.info("Tick the responsible-use box in the sidebar to view results.")
+    elif "b_res" in st.session_state:
+        br_res = st.session_state["b_res"]
+        recs = br_res.recs
+        if br_res.sig != (nsfw, timeout, retry, bool(proxy)):
+            st.warning("Settings changed since these results were generated. Check again to apply them.")
+        taken = [r for r in recs if r["status"] == Found.FOUND]
+        free = [r for r in recs if r["status"] == Found.NOT_FOUND]
+        unk = [r for r in recs if r["status"] == Found.UNKNOWN]
         ui.kpi_row([("Taken", len(taken), "handle in use", ui.CORAL), ("Free", len(free), "appears available", ui.TEAL),
                     ("Unknown", len(unk), "blocked or timed out", ui.MUTED)])
         st.markdown('<div class="sec">Platform status</div>', unsafe_allow_html=True)
-        items = [(r["site"], "Taken - review the account" if r["status"] == "Found" else
-                  "Free - consider registering" if r["status"] == "Not found" else "Could not determine",
-                  "taken" if r["status"] == "Found" else "free" if r["status"] == "Not found" else "unk")
+        items = [(r["site"], "Taken - review the account" if r["status"] == Found.FOUND else
+                  "Free - consider registering" if r["status"] == Found.NOT_FOUND else "Could not determine",
+                  "taken" if r["status"] == Found.FOUND else "free" if r["status"] == Found.NOT_FOUND else "unk")
                  for r in sorted(recs, key=lambda x: (x["status"], x["site"].lower()))]
         st.markdown(ui.tiles(items), unsafe_allow_html=True)
         st.caption("'Free' reflects detection logic, not a reservation. Platform rules may still block registration "
@@ -317,9 +352,13 @@ with t_email:
                 br, br_err = N.hibp(em, hk)
                 sites = N.run_holehe(em) if use_holehe else []
             store.audit("email", em.split("@")[1], purpose)
-            st.session_state["em_res"] = (em, basic, br, br_err, sites, bool(hk), use_holehe)
-    if "em_res" in st.session_state:
-        em, basic, br, br_err, sites, had_key, used_h = st.session_state["em_res"]
+            st.session_state["em_res"] = EmailResult(em, basic, br, br_err, sites, bool(hk), use_holehe)
+    if "em_res" in st.session_state and not consent:
+        st.info("Tick the responsible-use box in the sidebar to view results.")
+    elif "em_res" in st.session_state:
+        er = st.session_state["em_res"]
+        basic, br, br_err, sites = er.basic, er.breaches, er.breach_error, er.holehe_sites
+        had_key, used_h = er.had_api_key, er.holehe_used
         ui.kpi_row([("Mail servers", len(basic.get("mx", [])), "MX records", ui.TEAL if basic.get("mx") else ui.CORAL),
                     ("Gravatar", "Yes" if basic.get("gravatar") else "No", "public avatar linked"),
                     ("Known breaches", len(br) if had_key and not br_err else "n/a",
@@ -354,9 +393,12 @@ with t_domain:
                           "hdr": ex.submit(N.security_headers, d)}
                     res = {k: f.result() for k, f in fs.items()}
             store.audit("domain", d, purpose)
-            st.session_state["dm_res"] = (d, res)
-    if "dm_res" in st.session_state:
-        d, r = st.session_state["dm_res"]
+            st.session_state["dm_res"] = DomainResult(d, res)
+    if "dm_res" in st.session_state and not consent:
+        st.info("Tick the responsible-use box in the sidebar to view results.")
+    elif "dm_res" in st.session_state:
+        dres = st.session_state["dm_res"]
+        d, r = dres.domain, dres.data
         grades = N.email_auth_grade(r["dns"])
         hdr = r["hdr"]
         hdr_ok = sum(v[0] for v in hdr.values()) if hdr else 0
@@ -436,6 +478,10 @@ with t_hist:
             c1, c2 = st.columns(2)
             a = c1.selectbox("Older run", list(lab), format_func=lab.get, index=min(1, len(lab) - 1))
             b = c2.selectbox("Newer run", list(lab), format_func=lab.get, index=0)
+            sk = {r["id"]: r["summary"].get("scope_key") for r in uname_runs}
+            if sk[a] != sk[b]:
+                st.warning("These runs used different settings (engines, categories, NSFW or verification). "
+                           "Differences may reflect the settings, not real changes.")
             new, gone = store.diff_runs(store.get_run(a), store.get_run(b))
             c1.success(f"New accounts ({len(new)}): " + (", ".join(new) or "none"))
             c2.warning(f"No longer found ({len(gone)}): " + (", ".join(gone) or "none"))
@@ -461,7 +507,8 @@ merged by site. Each found account is re-requested once and checked for soft-404
 **Confidence**
 - {ui.pill("High", ui.TEAL)} detected by two or more engines
 - {ui.pill("Medium", ui.AMBER)} detected by one engine and passed the second-request check
-- {ui.pill("Low", ui.CORAL)} single engine, or the verification looked suspicious or could not run
+- {ui.pill("Low", ui.CORAL)} the second-request check looked suspicious (soft 404, error page, redirect to home)
+- {ui.pill("Unverified", ui.MUTED)} single engine and the check was off, blocked, or beyond the verification cap
 
 **Limits.** Sites change often and some block automated requests, so expect false positives and gaps. On a shared host
 (e.g. Streamlit Community Cloud) more sites will rate-limit or block you than on your own machine.

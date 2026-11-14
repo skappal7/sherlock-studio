@@ -25,11 +25,12 @@ def excel_bytes(username, records, meta: dict):
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as xw:
         summ = pd.DataFrame({"Item": ["Username", "Generated", "Engines", "Sites checked", "Found",
-                                      "High confidence", "Medium", "Low"],
+                                      "High confidence", "Medium", "Low", "Unverified"],
                              "Value": [username, time.strftime("%Y-%m-%d %H:%M"), ", ".join(meta.get("engines", [])),
                                        len(df), len(found), int((found.confidence == "High").sum()),
                                        int((found.confidence == "Medium").sum()),
-                                       int((found.confidence == "Low").sum())]})
+                                       int((found.confidence == "Low").sum()),
+                                       int((found.confidence == "Unverified").sum())]})
         summ.to_excel(xw, sheet_name="Summary", index=False)
         found.to_excel(xw, sheet_name="Found", index=False)
         df.to_excel(xw, sheet_name="All", index=False)
@@ -56,7 +57,7 @@ def html_report(username, records, meta):
     return f"""<!doctype html><meta charset=utf-8><title>Footprint report - {esc(username)}</title>
 <style>body{{font:14px system-ui;margin:40px;color:#111}}h1{{margin:0}}table{{border-collapse:collapse;width:100%;margin-top:16px}}
 td,th{{border-bottom:1px solid #ddd;padding:6px 8px;text-align:left}}th{{background:#f4f4f4}}.c-High{{color:#0a8f7f;font-weight:600}}
-.c-Medium{{color:#b7791f;font-weight:600}}.c-Low{{color:#c53030;font-weight:600}}.m{{color:#666}}</style>
+.c-Medium{{color:#b7791f;font-weight:600}}.c-Low{{color:#c53030;font-weight:600}}.c-Unverified{{color:#666;font-weight:600}}.m{{color:#666}}</style>
 <h1>Footprint report: {esc(username)}</h1>
 <p class=m>Generated {time.strftime('%Y-%m-%d %H:%M')} &middot; Engines: {esc(', '.join(meta.get('engines', [])))} &middot;
 {len(df)} sites checked &middot; {len(found)} found</p>

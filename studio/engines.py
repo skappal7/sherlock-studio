@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 
 import requests
 
+from .models import (CONF_ORDER, Conf, Found, Raw, Stage, StageError, Verify)  # noqa: F401
+
 UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124 Safari/537.36"}
 WMN_URL = "https://raw.githubusercontent.com/WebBreacher/WhatsMyName/main/wmn-data.json"
 NSFW_CAT = "xx NSFW xx"
@@ -68,9 +70,9 @@ def guess_category(name: str, url: str = "") -> str:
     return "other"
 
 
-def row(engine, site, status, url, category="other", ms=None, note=""):
-    return {"engine": engine, "site": site, "status": status, "url": url,
-            "category": category, "ms": ms, "note": note}
+def row(engine, site, status, url, category="other", ms=None, note="", attempts=1):
+    return {"engine": engine, "site": site, "status": Raw.parse(status), "url": url,
+            "category": category, "ms": ms, "note": note, "attempts": attempts}
 
 
 ProgressFn = Callable[[int, int, str], None]
@@ -112,6 +114,27 @@ class SherlockEngine:
 
 
 # ------------------------------------------------------------------ WhatsMyName
+def wmn_classify(site: dict, status_code: int, text: str) -> Raw:
+    """Decision table for one WhatsMyName response. Precedence (first match wins):
+
+    1. WAF        - 403/429/503 that the site's own e_code/m_code do not account for
+    2. AVAILABLE  - m_string present, or status == m_code (only when m_code differs from e_code)
+    3. CLAIMED    - status == e_code and (no e_string, or e_string present)
+    4. UNKNOWN    - anything else
+    Absence outranks presence so that a page matching both rules is never reported as a found account.
+    """
+    e_code, m_code = site.get("e_code"), site.get("m_code")
+    e_str, m_str = site.get("e_string"), site.get("m_string")
+    if status_code in (403, 429, 503) and status_code not in (e_code, m_code):
+        return Raw.WAF
+    absent = bool(m_str and m_str in text) or (m_code is not None and m_code != e_code and status_code == m_code)
+    if absent:
+        return Raw.AVAILABLE
+    if status_code == e_code and (not e_str or e_str in text):
+        return Raw.CLAIMED
+    return Raw.UNKNOWN
+
+
 class WMNEngine:
     name = "WhatsMyName"
 
@@ -140,20 +163,10 @@ class WMNEngine:
                 r = requests.get(url, headers=headers, timeout=timeout, proxies=proxies,
                                  allow_redirects=False)
         except requests.RequestException as e:
-            return row("WhatsMyName", site["name"], "Unknown", pretty, site.get("cat", "other"),
+            return row("WhatsMyName", site["name"], Raw.UNKNOWN, pretty, site.get("cat", "other"),
                        note=type(e).__name__)
         ms = round((time.time() - s) * 1000)
-        text = r.text or ""
-        e_code, m_code = site.get("e_code"), site.get("m_code")
-        e_str, m_str = site.get("e_string"), site.get("m_string")
-        if r.status_code in (403, 429, 503) and r.status_code not in (e_code, m_code):
-            status = "WAF"
-        elif (m_str and m_str in text) or r.status_code == m_code:
-            status = "Available"
-        elif r.status_code == e_code and (not e_str or e_str in text):
-            status = "Claimed"
-        else:
-            status = "Unknown"
+        status = wmn_classify(site, r.status_code, r.text or "")
         return row("WhatsMyName", site["name"], status, pretty, site.get("cat", "other"), ms)
 
     def run(self, username, names, timeout, progress: ProgressFn | None = None, proxy=None):
@@ -203,7 +216,7 @@ def run_maigret(username, timeout=15, progress: ProgressFn | None = None, proxy=
                 if st and "claim" not in str(st).lower():
                     continue
                 url = v.get("url_user") or v.get("url_main", "")
-                out.append(row("Maigret", site, "Claimed", url, guess_category(site, url)))
+                out.append(row("Maigret", site, Raw.CLAIMED, url, guess_category(site, url)))
     if progress:
         progress(1, 1, "Maigret")
     return out
@@ -221,21 +234,21 @@ def verify_one(url, timeout=10, proxy=None):
     try:
         r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True, proxies=proxies)
     except requests.RequestException:
-        return "unverified", "unreachable"
+        return Verify.UNVERIFIED, "unreachable"
     if r.status_code in (403, 429, 503):
-        return "unverified", f"HTTP {r.status_code}"
+        return Verify.UNVERIFIED, f"HTTP {r.status_code}"
     if r.status_code >= 400:
-        return "suspect", f"HTTP {r.status_code}"
+        return Verify.SUSPECT, f"HTTP {r.status_code}"
     body = (r.text or "")[:30000].lower()
     title = re.search(r"<title[^>]*>(.*?)</title>", body, re.S)
     t = title.group(1) if title else ""
     if any(p in t for p in SOFT_404):
-        return "suspect", "error title"
+        return Verify.SUSPECT, "error title"
     if any(p in body for p in SOFT_404[:6]) and len(body) < 15000:
-        return "suspect", "not-found text"
+        return Verify.SUSPECT, "not-found text"
     if urlparse(url).path.strip("/") and not urlparse(r.url).path.strip("/"):
-        return "suspect", "redirected to home"
-    return "ok", ""
+        return Verify.SUSPECT, "redirected to home"
+    return Verify.OK, ""
 
 
 def verify_many(urls, timeout=10, workers=20, progress: ProgressFn | None = None, proxy=None):
@@ -249,55 +262,97 @@ def verify_many(urls, timeout=10, workers=20, progress: ProgressFn | None = None
     return res
 
 
-# ------------------------------------------------------------------ merge + confidence
+# ------------------------------------------------------------------ merge -> verify -> score
 def merge(rows: list[dict], engines_run: list[str]):
-    """Collapse per-engine rows into one record per site."""
+    """Collapse per-engine rows into one record per site. Output stage: MERGED."""
     by = {}
     for r in rows:
         k = norm_key(r["site"])
         m = by.setdefault(k, {"site": r["site"], "category": "other", "url": r["url"],
-                              "engines": {}, "ms": r["ms"]})
-        m["engines"][r["engine"]] = r["status"]
+                              "engines": {}, "ms": r["ms"], "attempts": 1})
+        m["engines"][r["engine"]] = Raw.parse(r["status"])
+        m["attempts"] = max(m["attempts"], r.get("attempts", 1))
         if r["category"] != "other" or m["category"] == "other":
             m["category"] = r["category"]
-        if r["status"] == "Claimed":
+        if Raw.parse(r["status"]) is Raw.CLAIMED:
             m["url"] = r["url"]
     out = []
     for m in by.values():
         sts = list(m["engines"].values())
-        found_by = sts.count("Claimed")
+        found_by = sts.count(Raw.CLAIMED)
         if found_by:
-            status = "Found"
-        elif sts and all(s == "Available" for s in sts):
-            status = "Not found"
+            status = Found.FOUND
+        elif sts and all(x is Raw.AVAILABLE for x in sts):
+            status = Found.NOT_FOUND
         else:
-            status = "Unknown"
+            status = Found.UNKNOWN
         out.append({"site": m["site"], "category": m["category"], "status": status, "url": m["url"],
-                    "found_by": found_by, "checked_by": len(sts),
-                    "engines": ", ".join(e for e, s in m["engines"].items() if s == "Claimed"),
-                    "verify": "", "confidence": ""})
+                    "found_by": found_by, "checked_by": len(sts), "attempts": m["attempts"],
+                    "engines": ", ".join(e for e, x in m["engines"].items() if x is Raw.CLAIMED),
+                    "verify": Verify.NOT_RUN, "verify_note": "", "confidence": Conf.NONE,
+                    "stage": Stage.MERGED})
     return out
 
 
-def score(records: list[dict]):
+def _require(records, stage):
+    bad = [r["site"] for r in records if r.get("stage") != stage]
+    if bad:
+        raise StageError(f"expected stage '{stage}', got a different stage for {len(bad)} record(s), e.g. {bad[0]}")
+
+
+def apply_verification(records: list[dict], results: dict | None):
+    """MERGED -> VERIFIED. results maps url -> (Verify, note); None means verification was switched off.
+
+    Found accounts that have no result (beyond the verification cap) are marked SKIPPED rather than left blank.
+    """
+    _require(records, Stage.MERGED)
     for r in records:
-        if r["status"] != "Found":
-            r["confidence"] = ""
-            continue
-        if r["verify"] == "suspect":
-            r["confidence"] = "Low"
-        elif r["found_by"] >= 2:
-            r["confidence"] = "High"
-        elif r["verify"] == "ok":
-            r["confidence"] = "Medium"
+        if r["status"] != Found.FOUND:
+            r["verify"] = Verify.NOT_RUN
+        elif results is None:
+            r["verify"], r["verify_note"] = Verify.NOT_RUN, ""
+        elif r["url"] in results:
+            state, note = results[r["url"]]
+            r["verify"], r["verify_note"] = Verify(state), note
         else:
-            r["confidence"] = "Low"
+            r["verify"], r["verify_note"] = Verify.SKIPPED, "beyond verification cap"
+        r["stage"] = Stage.VERIFIED
+    return records
+
+
+def confidence_for(status, found_by: int, verify) -> Conf:
+    """Explicit decision table (first match wins):
+
+    not found                   -> NONE
+    verify == SUSPECT           -> LOW
+    found by 2+ engines         -> HIGH
+    verify == OK                -> MEDIUM
+    anything else (single engine, verification off / skipped / blocked) -> UNVERIFIED
+    """
+    if status != Found.FOUND:
+        return Conf.NONE
+    if verify == Verify.SUSPECT:
+        return Conf.LOW
+    if found_by >= 2:
+        return Conf.HIGH
+    if verify == Verify.OK:
+        return Conf.MEDIUM
+    return Conf.UNVERIFIED
+
+
+def score(records: list[dict]):
+    """VERIFIED -> SCORED."""
+    _require(records, Stage.VERIFIED)
+    for r in records:
+        r["confidence"] = confidence_for(r["status"], r["found_by"], r["verify"])
+        r["stage"] = Stage.SCORED
     return records
 
 
 # ------------------------------------------------------------------ orchestrator
 def run_username(username, engines: dict, categories, timeout, retry_unknown=True, verify=True,
-                 proxy=None, extra_maigret=False, only=None, progress: ProgressFn | None = None):
+                 proxy=None, extra_maigret=False, only=None, progress: ProgressFn | None = None,
+                 verify_cap: int = 300):
     """engines: {'Sherlock': SherlockEngine, 'WhatsMyName': WMNEngine}. Returns merged records."""
     rows, ran = [], []
     n_steps = len(engines) + (1 if extra_maigret else 0) + (1 if verify else 0)
@@ -315,11 +370,17 @@ def run_username(username, engines: dict, categories, timeout, retry_unknown=Tru
             names = [n for n in names if norm_key(n) in only]
         res = eng.run(username, names, timeout, sub(label), proxy)
         if retry_unknown:
-            bad = [r["site"] for r in res if r["status"] in ("Unknown", "WAF")]
+            bad = {r["site"] for r in res if r["status"] in (Raw.UNKNOWN, Raw.WAF)}
             if bad:
-                again = eng.run(username, bad, timeout * 2, None, proxy)
-                keep = {r["site"]: r for r in again}
-                res = [keep.get(r["site"], r) if r["site"] in bad else r for r in res]
+                again = {r["site"]: r for r in eng.run(username, sorted(bad), timeout * 2, None, proxy)}
+                merged_rows = []
+                for r in res:
+                    if r["site"] in bad:
+                        n = again.get(r["site"])
+                        r = n if n is not None and Raw.parse(n["status"]).definitive else r
+                        r = {**r, "attempts": 2}
+                    merged_rows.append(r)
+                res = merged_rows
         rows += res
         ran.append(label)
         step[0] += 1
@@ -328,11 +389,11 @@ def run_username(username, engines: dict, categories, timeout, retry_unknown=Tru
         ran.append("Maigret")
         step[0] += 1
     recs = merge(rows, ran)
+    results = None
     if verify:
-        found = [r for r in recs if r["status"] == "Found"][:200]
-        res = verify_many([r["url"] for r in found], progress=sub("Verifying"), proxy=proxy)
-        for r in found:
-            r["verify"], r["verify_note"] = res.get(r["url"], ("unverified", ""))
+        targets = [r for r in recs if r["status"] == Found.FOUND][:verify_cap]
+        results = verify_many([r["url"] for r in targets], progress=sub("Verifying"), proxy=proxy)
+    apply_verification(recs, results)
     return score(recs), ran
 
 

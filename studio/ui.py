@@ -8,7 +8,7 @@ import streamlit as st
 
 AMBER, TEAL, CORAL, VIOLET, BLUE = "#F5B83D", "#3DD6C3", "#FF6B6B", "#9B8CFF", "#5AA9FF"
 MUTED, SURFACE, BORDER = "#8B95B5", "#131A30", "#243056"
-CONF_COLOR = {"High": TEAL, "Medium": AMBER, "Low": CORAL}
+CONF_COLOR = {"High": TEAL, "Medium": AMBER, "Low": CORAL, "Unverified": MUTED}
 CAT_PALETTE = [AMBER, TEAL, VIOLET, BLUE, CORAL, "#7BD88F", "#F58FD0", "#A0AEC0"]
 
 ICONS = {
@@ -101,7 +101,7 @@ def cards(records):
             f'<div class="top"><img loading="lazy" src="https://www.google.com/s2/favicons?domain={esc(host)}&sz=64">'
             f'<div class="n">{esc(r["site"])}</div></div>'
             f'<div class="meta"><span class="chip">{esc(r["category"])}</span>'
-            f'{pill(conf + " confidence", CONF_COLOR.get(conf, MUTED)) if conf else ""}</div>'
+            f'{pill(conf if conf == "Unverified" else conf + " confidence", CONF_COLOR.get(conf, MUTED)) if conf else ""}</div>'
             f'<div class="by">Detected by {esc(r.get("engines") or "-")}'
             f'{" &middot; verified" if r.get("verify") == "ok" else ""}'
             f'{" &middot; check manually" if r.get("verify") == "suspect" else ""}</div></a>')
