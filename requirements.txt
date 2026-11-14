@@ -1,0 +1,7 @@
+streamlit>=1.50
+sherlock-project>=0.16
+pandas>=2.2
+requests>=2.31
+dnspython>=2.4
+plotly>=5.20
+openpyxl>=3.1
