@@ -114,7 +114,7 @@ with st.sidebar:
     retry = st.toggle("Retry timeouts / blocks once", True)
     verify = st.toggle("Verify found accounts (second request)", True)
     proxy = st.text_input("Proxy (optional)", placeholder="http://host:port or socks5://host:port")
-    st.caption("Tor is only available if you run the app locally with a Tor proxy.")
+    st.caption("Examples: http://user:pass@host:8080, socks5h://127.0.0.1:9050 (Tor). Applies to all engines and verification.")
 
 engines, warns = get_engines(nsfw)
 for w in warns:

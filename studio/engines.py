@@ -174,13 +174,15 @@ def maigret_available() -> bool:
     return importlib.util.find_spec("maigret") is not None
 
 
-def run_maigret(username, timeout=15, progress: ProgressFn | None = None):
+def run_maigret(username, timeout=15, progress: ProgressFn | None = None, proxy=None):
     """Run the Maigret CLI and parse its simple JSON report. Parsing is defensive."""
     if not maigret_available():
         return []
     with tempfile.TemporaryDirectory() as d:
         cmd = [sys.executable, "-m", "maigret", username, "--json", "simple", "--folderoutput", d, "--timeout",
                str(timeout), "--no-progressbar", "--no-color", "--no-recursion"]
+        if proxy:
+            cmd += ["--proxy", proxy]
         try:
             subprocess.run(cmd, capture_output=True, timeout=600, check=False)
         except Exception:
@@ -214,9 +216,10 @@ SOFT_404 = ["page not found", "not found", "doesn't exist", "does not exist", "n
             "404 error", "nothing here", "account suspended", "page isn't available"]
 
 
-def verify_one(url, timeout=10):
+def verify_one(url, timeout=10, proxy=None):
+    proxies = {"http": proxy, "https": proxy} if proxy else None
     try:
-        r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True)
+        r = requests.get(url, headers=UA, timeout=timeout, allow_redirects=True, proxies=proxies)
     except requests.RequestException:
         return "unverified", "unreachable"
     if r.status_code in (403, 429, 503):
@@ -235,10 +238,10 @@ def verify_one(url, timeout=10):
     return "ok", ""
 
 
-def verify_many(urls, timeout=10, workers=20, progress: ProgressFn | None = None):
+def verify_many(urls, timeout=10, workers=20, progress: ProgressFn | None = None, proxy=None):
     res, total = {}, len(urls)
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(verify_one, u, timeout): u for u in urls}
+        futs = {ex.submit(verify_one, u, timeout, proxy): u for u in urls}
         for i, f in enumerate(as_completed(futs), 1):
             res[futs[f]] = f.result()
             if progress:
@@ -321,13 +324,13 @@ def run_username(username, engines: dict, categories, timeout, retry_unknown=Tru
         ran.append(label)
         step[0] += 1
     if extra_maigret:
-        rows += run_maigret(username, timeout, sub("Maigret"))
+        rows += run_maigret(username, timeout, sub("Maigret"), proxy)
         ran.append("Maigret")
         step[0] += 1
     recs = merge(rows, ran)
     if verify:
         found = [r for r in recs if r["status"] == "Found"][:200]
-        res = verify_many([r["url"] for r in found], progress=sub("Verifying"))
+        res = verify_many([r["url"] for r in found], progress=sub("Verifying"), proxy=proxy)
         for r in found:
             r["verify"], r["verify_note"] = res.get(r["url"], ("unverified", ""))
     return score(recs), ran
